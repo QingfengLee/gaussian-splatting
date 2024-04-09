@@ -22,7 +22,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
 class GaussianModel:
-
+    # 从尺度和旋转参数中去构建3Dgaussian的协方差矩阵，L=RS，L@L的逆等于RSStRt，再去除对称性得到6个值表示对称的协方差矩阵
     def setup_functions(self): #用于设置一些激活函数和变换函数
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):#构建协方差矩阵，该函数接受 scaling（尺度）、scaling_modifier（尺度修正因子）、rotation（旋转）作为参数
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
@@ -45,14 +45,14 @@ class GaussianModel:
         self.active_sh_degree = 0  #球谐阶数
         self.max_sh_degree = sh_degree   #最大球谐阶数
         # 存储不同信息的张量（tensor）
-        self._xyz = torch.empty(0) #空间位置
-        self._features_dc = torch.empty(0)
-        self._features_rest = torch.empty(0)
+        self._xyz = torch.empty(0) #空间位置, 中心点位置, 也即3Dgaussian的均值
+        self._features_dc = torch.empty(0) # 第一个球谐系数, 球谐系数用来表示RGB颜色
+        self._features_rest = torch.empty(0) # 其余球谐系数
         self._scaling = torch.empty(0)  #椭球的形状尺度
-        self._rotation = torch.empty(0) #椭球的旋转
+        self._rotation = torch.empty(0) #椭球的旋转, 旋转参数，四元组
         self._opacity = torch.empty(0)  #不透明度
-        self.max_radii2D = torch.empty(0)
-        self.xyz_gradient_accum = torch.empty(0)
+        self.max_radii2D = torch.empty(0) # 投影到2D时, 每个2D gaussian最大的半径
+        self.xyz_gradient_accum = torch.empty(0) # 3Dgaussian的均值的累积梯度
         self.denom = torch.empty(0)
         self.optimizer = None  #初始化优化器为 None。
         self.percent_dense = 0  #初始化百分比密度为0。
@@ -121,24 +121,29 @@ class GaussianModel:
     def oneupSHdegree(self): #每 1000 次迭代，增加球谐函数的阶数。
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
-
+    
+    # 参数一：稀疏点云，参数二：球半径
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float): #用于从给定的点云数据 pcd 创建对象的初始化状态。
         self.spatial_lr_scale = spatial_lr_scale
+        # 点云转tensor类型，送到gpu
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        # 把点云的颜色转成sh系数，送到gpu
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        # 特征长度为16，第一个维度为sh系数，其他赋0
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
-
+        # 调用simple_knn的distCUDA2函数，计算点云中的每个点到与其最近的K个点的平均距离的平方
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        # 距离值取对数，得到缩放值，repeat变成3个
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
-
+        # 0.1的逆sigmoid值-2.1976，也即是-2.1976的sigmoid值0.1，初始化设置为不透明度
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
-
+        # 初始化位置，sh系数（直接+剩余），缩放（3个轴），旋转（四元数），不透明度（逆sigmoid的值），
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
@@ -151,7 +156,7 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-
+        # 参数列表，每一项是一个字典，包含位置、f_dc、f_rest、不透明度、缩放、旋转
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
@@ -160,8 +165,9 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
-
+        # 创建optimizer
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        # 创建对xyz参数进行学习率调整的scheduler
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,

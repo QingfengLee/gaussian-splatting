@@ -42,7 +42,9 @@ class SceneInfo(NamedTuple):
     nerf_normalization: dict
     ply_path: str
 
+# 计算这些相机的平均中心的负值和所在球半径大小
 def getNerfppNorm(cam_info):
+    # 计算这些相机的平均中心，以及到平均中心的最远距离，返回平均中心和最远距离
     def get_center_and_diag(cam_centers):
         cam_centers = np.hstack(cam_centers)
         avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)
@@ -52,7 +54,7 @@ def getNerfppNorm(cam_info):
         return center.flatten(), diagonal
 
     cam_centers = []
-
+    # 计算相机在世界坐标系的位置，并放入cam_centers列表中
     for cam in cam_info:
         W2C = getWorld2View2(cam.R, cam.T)
         C2W = np.linalg.inv(W2C)
@@ -65,6 +67,7 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
+# 读取相机信息，参数：相机外参，内参，图片目录，输出到列表中，列表每一项是CameraInfo类
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
@@ -104,6 +107,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     sys.stdout.write('\n')
     return cam_infos
 
+# 读取points3D.ply文件，读取位置、颜色和法线，并组合成BasicPointCloud类返回
 def fetchPly(path):
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
@@ -144,7 +148,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
     reading_dir = "images" if images == None else images
     cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
-
+    # 需要评估的话，训练集和测试集分一下，否则全部都拿来训练
     if eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
         test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
@@ -165,10 +169,11 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
     try:
+        # 读取ply文件
         pcd = fetchPly(ply_path)
     except:
         pcd = None
-
+    # 把这些组合成SceneInfo类返回
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
@@ -243,10 +248,11 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
 
         storePly(ply_path, xyz, SH2RGB(shs) * 255)
     try:
+        # 读取ply文件
         pcd = fetchPly(ply_path)
     except:
         pcd = None
-
+    # 把这些组合成SceneInfo类返回
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
@@ -254,6 +260,7 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+# 字典，存储对应的回调函数
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo

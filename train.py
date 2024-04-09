@@ -32,10 +32,13 @@ except ImportError:
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0 #初始化迭代次数。
     tb_writer = prepare_output_and_logger(dataset)  #设置 TensorBoard 写入器和日志记录器。
-    gaussians = GaussianModel(dataset.sh_degree) #（重点看，需要转跳）创建一个 GaussianModel 类的实例，输入一系列参数，其参数取自数据集。
-    scene = Scene(dataset, gaussians) #（这个类的主要目的是处理场景的初始化、保存和获取相机信息等任务，）创建一个 Scene 类的实例，使用数据集和之前创建的 GaussianModel 实例作为参数。
+     # （重点看，需要转跳），创建GaussianModel模型，给点云中的每个点去创建一个3D gaussian，输入一系列参数，其参数取自数据集。
+    gaussians = GaussianModel(dataset.sh_degree)
+    #（这个类的主要目的是处理场景的初始化、保存和获取相机信息等任务，）创建一个 Scene 类的实例，使用数据集和之前创建的 GaussianModel 实例作为参数。
+    # 加载数据集和每张图片对应的camera的参数
+    scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt) #设置 GaussianModel 的训练参数。
-    if checkpoint: #如果有提供检查点路径。
+    if checkpoint: #如果有提供检查点路径，如果checkpoint非空，则加载checkpoint，恢复模型参数和优化参数
         (model_params, first_iter) = torch.load(checkpoint)#通过 torch.load(checkpoint) 加载检查点的模型参数和起始迭代次数。
         gaussians.restore(model_params, opt)#通过 gaussians.restore 恢复模型的状态。
 
@@ -80,12 +83,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        # Render （渲染图像，计算损失（L1 loss 和 SSIM loss））
+        # Render （渲染图像，计算损失（L1 loss 和 SSIM loss））, 在debug_from步时，启动调试
         if (iteration - 1) == debug_from:
             pipe.debug = True
-
+        # 随机背景与否
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-
+        # render 函数参数一：上步随机选择的相机，参数二：高斯模型，参数三：管道参数，参数四：背景
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -116,12 +119,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration < opt.densify_until_iter: #在达到指定的迭代次数之前执行以下操作。
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter]) #将每个像素位置上的最大半径记录在 max_radii2D 中。这是为了密集化时进行修剪（pruning）操作时的参考。
+                 # 统计3D gaussian均值(xyz)的梯度, 用于对3D gaussians的克隆或者切分
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter) #将与密集化相关的统计信息添加到 gaussians 模型中，包括视图空间点和可见性过滤器。
-
+                 #每100步进行下面的操作，对3D gaussians进行克隆或者切分, 并将opacity小于一定阈值的3D gaussians进行删除
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0: #在指定的迭代次数之后，每隔一定的迭代间隔进行以下密集化操作。
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None #根据当前迭代次数设置密集化的阈值。如果当前迭代次数大于 opt.opacity_reset_interval，则设置 size_threshold 为 20，否则为 None。
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold) #执行密集化和修剪操作，其中包括梯度阈值、密集化阈值、相机范围和之前计算的 size_threshold。
-                
+                 #每3000步重设不透明度
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter): #在每隔一定迭代次数或在白色背景数据集上的指定迭代次数时，执行以下操作。
                     gaussians.reset_opacity() #重置模型中的某些参数，涉及到透明度的操作，具体实现可以在 reset_opacity 方法中找到。
 
@@ -141,11 +145,13 @@ def prepare_output_and_logger(args):
             unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
+        #生成一个随机的UUID，并取前十位作为输出目录名称
         args.model_path = os.path.join("./output/", unique_str[0:10])
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
+    #配置参数写入到cfg_args文件中
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
@@ -157,6 +163,7 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
+#写入日志
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer: #将 L1 loss、总体 loss 和迭代时间写入 TensorBoard。
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
@@ -222,14 +229,16 @@ if __name__ == "__main__":
     
     print("Optimizing " + args.model_path)
 
-    # Initialize system state (RNG)
+    # Initialize system state (RNG 随机数生成器)
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
+    # 在ip的port端口监听
     network_gui.init(args.ip, args.port) #这行代码初始化一个 GUI 服务器，使用 args.ip 和 args.port 作为参数。这可能是一个用于监视和控制训练过程的图形用户界面的一部分。
+    # 正向传播时：关闭自动求导的异常侦测
     torch.autograd.set_detect_anomaly(args.detect_anomaly) #这行代码设置 PyTorch 是否要检测梯度计算中的异常。
+    # 开始训练，函数参数：模型参数lp，优化参数，管道参数，测试迭代值，保存迭代值，检查点迭代值，开始检查点，调试来源。
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
     # 输入的参数包括：模型的参数（传入的为数据集的位置）、优化器的参数、其他pipeline的参数，测试迭代次数、保存迭代次数 、检查点迭代次数 、开始检查点 、调试起点
-
     # All done
     print("\nTraining complete.")
